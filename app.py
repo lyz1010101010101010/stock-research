@@ -270,6 +270,109 @@ def _analyze_stock_summary(code: str) -> dict:
         return result
 
 
+# ==================== 【新增】AI 评语 + 综合评分信号灯 ====================
+
+def _map_valuation_category(info: dict) -> str:
+    """将 '估值区间' 映射为三档：低估 / 合理 / 偏高"""
+    val = str(info.get("估值区间", ""))
+    if "低估" in val or "偏低" in val:
+        return "低估"
+    elif "合理" in val:
+        return "合理"
+    else:
+        return "偏高"  # 泡沫也归入偏高
+
+
+def _map_tech_category(info: dict) -> str:
+    """将 '趋势' 映射为三档：偏多 / 震荡 / 偏空"""
+    tech = str(info.get("趋势", ""))
+    if "多头" in tech or "偏多" in tech:
+        return "偏多"
+    elif "偏空" in tech or "空头" in tech:
+        return "偏空"
+    else:
+        return "震荡"
+
+
+def calc_score(info: dict) -> int:
+    """
+    【新增】根据估值 + 技术面计算综合评分 (0–100)。
+    评分规则：
+        估值=低估 → +40；合理 → +25；偏高 → +10
+        技术=偏多 → +30；震荡 → +15；偏空 → +5
+        基准分 = 30，上限 100
+    """
+    BASE = 30
+
+    # ---- 估值评分 ----
+    val_cat = _map_valuation_category(info)
+    val_bonus = {"低估": 40, "合理": 25, "偏高": 10}
+    val_score = val_bonus.get(val_cat, 10)
+
+    # ---- 技术评分 ----
+    tech_cat = _map_tech_category(info)
+    tech_bonus = {"偏多": 30, "震荡": 15, "偏空": 5}
+    tech_score = tech_bonus.get(tech_cat, 5)
+
+    return min(100, BASE + val_score + tech_score)
+
+
+def show_score(score: int):
+    """
+    【新增】信号灯展示。
+    ≥80：st.success + 进度条（🟢 强烈关注）
+    ≥60：st.warning（🟡 中性观察）
+    <60：st.error（🔴 谨慎回避）
+    """
+    if score >= 80:
+        st.success(f"🟢 综合评分: {score}/100 — 强烈关注")
+        st.progress(score / 100)
+    elif score >= 60:
+        st.warning(f"🟡 综合评分: {score}/100 — 中性观察")
+    else:
+        st.error(f"🔴 综合评分: {score}/100 — 谨慎回避")
+
+
+def ai_comment(name: str, code: str, info: dict, score: int) -> str:
+    """
+    【新增】基于规则生成 AI 一句结论（不调用外部 API）。
+    语气按分数档位：
+        高分 → 积极偏多
+        中分 → 中性跟踪
+        低分 → 谨慎回避
+    """
+    val_cat = _map_valuation_category(info)
+    tech_cat = _map_tech_category(info)
+
+    # 高分 (≥80)
+    if score >= 80:
+        pool = [
+            f"估值{val_cat}，技术面{tech_cat}，具备中长期关注价值，可考虑分批布局。",
+            f"综合评分优秀，{name}({code}) 估值与技术共振向上，建议纳入核心观察池。",
+            f"当前{name}处于估值洼地且趋势向好，中线持有逻辑清晰，值得重点跟踪。",
+        ]
+        return pool[hash(code + "high") % len(pool)]
+
+    # 中高分 (70-79)
+    if score >= 70:
+        pool = [
+            f"估值{val_cat}、技术{tech_cat}，整体偏积极但非最优，可小仓位试探。",
+            f"{name}方向偏多但仍有不确定性，建议结合大盘节奏灵活应对。",
+        ]
+        return pool[hash(code + "midhigh") % len(pool)]
+
+    # 中分 (60-69)
+    if score >= 60:
+        return "方向尚不明朗，估值与技术未能形成共振，建议持续跟踪，等待更明确的入场信号。"
+
+    # 低分 (<60)
+    pool = [
+        f"风险偏高（估值{val_cat}、技术{tech_cat}），建议暂时观望或回避。",
+        f"{name}({code}) 当前性价比不突出，不宜追高，等待回调或趋势明朗后再评估。",
+    ]
+    return pool[hash(code + "low") % len(pool)]
+
+
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="A 股智能分析工具", page_icon="📊", layout="wide")
 st.title("📊 A 股智能分析工具")
@@ -403,53 +506,38 @@ if st.session_state.batch_results:
         },
     )
 
-    # ---- 3 列卡片详情 ----
+    # ---- 3 列卡片详情（AI 评语 + 信号灯） ----
     st.markdown("---")
-    st.markdown("#### 🃏 个股卡片")
+    st.markdown("#### 🃏 个股卡片 · AI 评语")
 
     cols = st.columns(3)
     for i, r in enumerate(results):
         with cols[i % 3]:
-            score = r["评分"]
-            # 评分颜色
-            if score >= 75:
-                bar_color = "🟢"
-            elif score >= 60:
-                bar_color = "🟢"
-            elif score >= 40:
-                bar_color = "🟡"
-            elif score >= 25:
-                bar_color = "🟠"
-            else:
-                bar_color = "🔴"
+            # ---- 【新增】用 calc_score 重新计算信号灯评分 ----
+            ai_score = calc_score(r)
+            comment = ai_comment(r["名称"], r["代码"], r, ai_score)
 
             with st.container(border=True):
-                # 标题行
+                # ① 股票名称 + 代码
                 st.markdown(f"**{r['代码']}** {r['名称']}")
                 st.caption(f"最新价: {r['最新价']}")
 
-                # 估值行
-                st.markdown(
-                    f"估值: **{r['估值区间']}**　"
-                    f"PE分位: {r['PE分位']:.1f}%　"
-                    f"PB分位: {r['PB分位']:.1f}%"
-                    if r['PE分位'] is not None and r['PB分位'] is not None
-                    else f"估值: **{r['估值区间']}**"
-                )
+                # ② 估值 / 技术 精简标签
+                val_cat = _map_valuation_category(r)
+                tech_cat = _map_tech_category(r)
+                col_v, col_t = st.columns(2)
+                with col_v:
+                    v_icon = {"低估": "🟢", "合理": "🟡", "偏高": "🔴"}.get(val_cat, "⚪")
+                    st.caption(f"{v_icon} 估值: {val_cat}")
+                with col_t:
+                    t_icon = {"偏多": "🟢", "震荡": "🟡", "偏空": "🔴"}.get(tech_cat, "⚪")
+                    st.caption(f"{t_icon} 技术: {tech_cat}")
 
-                # 技术指标行
-                st.markdown(
-                    f"趋势: {r['趋势']} | MACD: {r['MACD']} | KDJ: {r['KDJ']}"
-                )
-                st.markdown(
-                    f"RSI: {r['RSI']} ({r['RSI信号']}) | 量价: {r['量价信号']}"
-                )
-                if r["最大回撤"] != "—":
-                    st.caption(f"最大回撤: {r['最大回撤']}")
+                # ③ 评分信号灯
+                show_score(ai_score)
 
-                # 评分条
-                st.progress(score / 100, text=f"{bar_color} 评分: {score}/100")
-                st.caption(r["建议"])
+                # ④ AI 评语
+                st.caption(f"💬 {comment}")
 
     # 清除按钮
     if st.button("🗑️ 清除批量结果"):
