@@ -35,6 +35,27 @@ from analysis.momentum import analyze_momentum
 from analysis.volume import analyze_volume
 from analysis.structure import analyze_structure
 
+# ==================== 【修复】Streamlit Cloud RemoteDisconnected ====================
+# 1) 全局 requests User-Agent 补丁，避免被远端拒绝
+import requests as _requests
+
+_orig_get = _requests.get
+
+def _patched_get(*args, **kwargs):
+    kwargs.setdefault("headers", {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    })
+    return _orig_get(*args, **kwargs)
+
+_requests.get = _patched_get
+
+# 2) akshare 重试装饰器（将在 fetch_price 中使用）
+import time as _time
+
 # ==================== 常量 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_PATH = os.path.join(BASE_DIR, "watchlist.json")

@@ -7,6 +7,7 @@
 
 import sys
 import os
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -109,18 +110,22 @@ def _try_fetch_via_daily(
     adjust: str,
 ) -> pd.DataFrame | None:
     """
-    尝试通过 stock_zh_a_daily（新浪）接口获取。
+    尝试通过 stock_zh_a_daily（新浪）接口获取（带 3 次重试）。
     返回列：date, open, close, high, low, volume, amount, pct_chg
     """
-    try:
-        df = ak.stock_zh_a_daily(
-            symbol=prefixed_symbol,
-            start_date=start_date,
-            end_date=end_date,
-            adjust=adjust,
-        )
-    except Exception:
-        return None
+    for i in range(3):
+        try:
+            df = ak.stock_zh_a_daily(
+                symbol=prefixed_symbol,
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            )
+            break
+        except Exception:
+            if i == 2:
+                return None
+            time.sleep(2)
 
     if df is None or df.empty:
         return None
@@ -138,6 +143,26 @@ def _try_fetch_via_daily(
     return df
 
 
+def safe_get_hist(ak, symbol: str, start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
+    """
+    【修复 Streamlit Cloud RemoteDisconnected】
+    带 3 次重试的 stock_zh_a_hist 包装器，失败间隔 2 秒。
+    """
+    for i in range(3):
+        try:
+            return ak.stock_zh_a_hist(
+                symbol=symbol,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            )
+        except Exception:
+            if i == 2:
+                raise
+            time.sleep(2)
+
+
 def _try_fetch_via_hist(
     ak,
     symbol: str,
@@ -146,16 +171,10 @@ def _try_fetch_via_hist(
     adjust: str,
 ) -> pd.DataFrame | None:
     """
-    尝试通过 stock_zh_a_hist（东方财富）接口获取。
+    尝试通过 stock_zh_a_hist（东方财富）接口获取（带重试）。
     """
     try:
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust=adjust,
-        )
+        df = safe_get_hist(ak, symbol, start_date, end_date, adjust)
     except Exception:
         return None
 
