@@ -26,6 +26,14 @@ from screen import screen_stocks
 # ---------- 自选股看板依赖 ----------
 import akshare as ak
 from data.fetch_price import fetch_daily_price
+from data.fetch_fundamental import fetch_stock_name
+
+# ---------- 批量分析依赖 ----------
+from analysis.valuation import analyze_valuation
+from analysis.trend import analyze_trend
+from analysis.momentum import analyze_momentum
+from analysis.volume import analyze_volume
+from analysis.structure import analyze_structure
 
 # ==================== 常量 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,16 +131,333 @@ def _fetch_tech_signals(symbol: str):
         return "—", "—"
 
 
+# ==================== 结构化分析（批量用） ====================
+def _analyze_stock_summary(code: str) -> dict:
+    """
+    【新增】对单只股票执行完整分析，返回结构化 dict。
+    包含：代码、名称、估值、技术指标、综合评分。
+    用于 sidebar 批量分析的结果展示。
+    """
+    # 获取名称
+    try:
+        name = fetch_stock_name(code)
+    except Exception:
+        name = code
+
+    result = {
+        "代码": code,
+        "名称": name,
+        "最新价": "—",
+        "估值区间": "—",
+        "PE分位": None,
+        "PB分位": None,
+        "趋势": "—",
+        "MACD": "—",
+        "KDJ": "—",
+        "RSI": None,
+        "RSI信号": "—",
+        "量价信号": "—",
+        "最大回撤": "—",
+        "评分": 50,
+        "建议": "—",
+    }
+
+    try:
+        df = fetch_daily_price(code)
+        if df is None or df.empty:
+            result["建议"] = "❌ 数据不足"
+            return result
+
+        close = df["close"].astype(float)
+        if close.empty:
+            result["建议"] = "❌ 数据不足"
+            return result
+
+        latest_price = float(close.iloc[-1])
+        result["最新价"] = f"{latest_price:.2f}"
+
+        # ---- 估值 ----
+        valuation = analyze_valuation(code)
+        result["PE分位"] = valuation.pe_percentile
+        result["PB分位"] = valuation.pb_percentile
+        result["估值区间"] = valuation.valuation_range
+
+        # ---- 趋势 ----
+        trend = analyze_trend(df)
+        result["趋势"] = trend.trend_direction
+
+        # ---- 动能 (MACD / KDJ / RSI) ----
+        momentum = analyze_momentum(df)
+        result["MACD"] = momentum.macd_signal
+        result["KDJ"] = momentum.kdj_signal
+        result["RSI"] = round(momentum.rsi, 1) if momentum.rsi is not None else None
+        result["RSI信号"] = momentum.rsi_signal or "—"
+
+        # ---- 量价 ----
+        volume = analyze_volume(df)
+        result["量价信号"] = volume.price_volume_signal
+
+        # ---- 结构 ----
+        structure = analyze_structure(df)
+        if structure.max_drawdown is not None:
+            result["最大回撤"] = f"{structure.max_drawdown:.1f}%"
+
+        # ======== 综合评分 (0-100) ========
+        score = 50  # 中性基准
+
+        # 估值评分 (±25)
+        vr = valuation.valuation_range
+        if vr == "低估":
+            score += 25
+        elif vr == "合理偏低":
+            score += 15
+        elif vr == "合理":
+            score += 5
+        elif vr == "偏高":
+            score -= 15
+        elif vr == "泡沫":
+            score -= 25
+
+        # 趋势评分 (±15)
+        td = trend.trend_direction
+        if td == "多头排列":
+            score += 15
+        elif td == "震荡偏多":
+            score += 8
+        elif td == "震荡偏空":
+            score -= 8
+        elif td == "空头排列":
+            score -= 15
+
+        # MACD 评分 (±10)
+        if momentum.macd_signal == "金叉":
+            score += 10
+        elif momentum.macd_signal == "死叉":
+            score -= 10
+
+        # KDJ 评分 (±5)
+        kdj = momentum.kdj_signal or ""
+        if "金叉" in kdj:
+            score += 5
+        elif "死叉" in kdj:
+            score -= 5
+
+        # 量价评分 (±5)
+        pv = volume.price_volume_signal or ""
+        if "放量上涨" in pv:
+            score += 5
+        elif "放量下跌" in pv:
+            score -= 5
+
+        result["评分"] = max(0, min(100, score))
+
+        # 综合建议
+        if score >= 75:
+            result["建议"] = "🟢 强烈关注"
+        elif score >= 60:
+            result["建议"] = "🟢 可以关注"
+        elif score >= 40:
+            result["建议"] = "🟡 中性观望"
+        elif score >= 25:
+            result["建议"] = "🟠 谨慎回避"
+        else:
+            result["建议"] = "🔴 建议回避"
+
+        return result
+
+    except Exception as e:
+        result["建议"] = f"❌ 异常: {e}"
+        return result
+
+
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="A 股智能分析工具", page_icon="📊", layout="wide")
 st.title("📊 A 股智能分析工具")
 st.caption("基于估值分位 + 多维度技术指标的综合研判工具")
+
+# ==================== 【新增】Sidebar: 自选股 + 批量分析 ====================
+with st.sidebar:
+    st.header("📋 自选股 + 批量分析")
+
+    st.markdown("**多只 A 股代码**（逗号分隔）")
+    batch_input = st.text_area(
+        "股票代码",
+        placeholder="例如：600887,000001,600519",
+        height=100,
+        label_visibility="collapsed",
+        key="sidebar_batch_input",
+    )
+
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        parse_btn = st.button("🔍 解析代码", use_container_width=True)
+    with col_s2:
+        analyze_all_btn = st.button("🚀 批量分析", type="primary", use_container_width=True)
+
+    if parse_btn:
+        raw = batch_input.replace("，", ",").replace("、", ",").replace("\n", ",")
+        parsed = [c.strip() for c in raw.split(",") if c.strip()]
+        # 过滤出 6 位数字代码
+        valid_codes = [c for c in parsed if c.isdigit() and len(c) == 6]
+        invalid = [c for c in parsed if not (c.isdigit() and len(c) == 6)]
+        if invalid:
+            st.warning(f"以下代码格式不正确已忽略：{', '.join(invalid)}")
+        if valid_codes:
+            st.session_state.batch_codes = valid_codes
+            st.success(f"✅ 已解析 {len(valid_codes)} 只股票：{' · '.join(valid_codes)}")
+        else:
+            st.warning("未识别到有效的 6 位股票代码")
+
+    if analyze_all_btn:
+        raw = batch_input.replace("，", ",").replace("、", ",").replace("\n", ",")
+        parsed = [c.strip() for c in raw.split(",") if c.strip()]
+        valid_codes = [c for c in parsed if c.isdigit() and len(c) == 6]
+        if not valid_codes:
+            # 尝试从已解析的代码中获取
+            if st.session_state.get("batch_codes"):
+                valid_codes = st.session_state.batch_codes
+        if not valid_codes:
+            st.error("请先输入有效代码并点击「解析代码」")
+        else:
+            st.session_state.batch_codes = valid_codes
+            st.session_state.batch_results = None  # 触发分析
+            st.rerun()
+
+    # 如果 codes 已解析但尚未分析，给出提示
+    if st.session_state.get("batch_codes") and st.session_state.get("batch_results") is None:
+        st.info(f"📌 待分析 {len(st.session_state.batch_codes)} 只股票，点击「🚀 批量分析」开始")
+
+    st.markdown("---")
+    st.caption("💡 提示：分析过程需要获取行情、估值及技术指标，每只股票约需 3~5 秒。")
 
 # ---- 初始化 session_state ----
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = _load_watchlist()
 if "jump_code" not in st.session_state:
     st.session_state.jump_code = ""
+# ---- 【新增】批量分析 session_state ----
+if "batch_codes" not in st.session_state:
+    st.session_state.batch_codes = []
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results = None
+
+# ==================== 【新增】批量分析结果展示（主区域） ====================
+# 当 sidebar 触发了 st.rerun() 后，在此处执行分析并展示结果
+if st.session_state.batch_results is None and st.session_state.batch_codes:
+    # 需要执行分析
+    codes = st.session_state.batch_codes
+    results = []
+    progress = st.progress(0, text="正在批量分析…")
+    for i, code in enumerate(codes):
+        progress.progress((i) / len(codes), text=f"正在分析 [{i+1}/{len(codes)}] {code} …")
+        results.append(_analyze_stock_summary(code))
+    progress.progress(1.0, text=f"✅ 全部完成！共分析 {len(codes)} 只股票")
+    st.session_state.batch_results = results
+    st.rerun()
+
+# 展示已缓存的结果
+if st.session_state.batch_results:
+    results = st.session_state.batch_results
+    codes = st.session_state.batch_codes
+
+    st.markdown("---")
+    st.markdown("### 📊 批量分析结果")
+
+    # ---- 3 列指标卡片 ----
+    col_total, col_avg, col_best = st.columns(3)
+    scores = [r["评分"] for r in results]
+    with col_total:
+        st.metric("分析股票数", len(results))
+    with col_avg:
+        avg_score = sum(scores) / len(scores) if scores else 0
+        st.metric("平均评分", f"{avg_score:.0f}/100")
+    with col_best:
+        if scores:
+            best_idx = scores.index(max(scores))
+            best = results[best_idx]
+            st.metric("最高评分", f"{best['代码']} {best['评分']}/100")
+        else:
+            st.metric("最高评分", "—")
+
+    st.markdown("---")
+
+    # ---- DataFrame 总览表 ----
+    st.markdown("#### 📋 总览表")
+    df = pd.DataFrame(results)
+    display_cols = [
+        "代码", "名称", "最新价", "估值区间", "PE分位", "PB分位",
+        "趋势", "MACD", "KDJ", "RSI", "量价信号", "评分", "建议",
+    ]
+    display_df = df[[c for c in display_cols if c in df.columns]].copy()
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "PE分位": st.column_config.NumberColumn(format="%.1f%%"),
+            "PB分位": st.column_config.NumberColumn(format="%.1f%%"),
+            "RSI": st.column_config.NumberColumn(format="%.1f"),
+            "评分": st.column_config.ProgressColumn(
+                format="%d/100", min_value=0, max_value=100,
+            ),
+        },
+    )
+
+    # ---- 3 列卡片详情 ----
+    st.markdown("---")
+    st.markdown("#### 🃏 个股卡片")
+
+    cols = st.columns(3)
+    for i, r in enumerate(results):
+        with cols[i % 3]:
+            score = r["评分"]
+            # 评分颜色
+            if score >= 75:
+                bar_color = "🟢"
+            elif score >= 60:
+                bar_color = "🟢"
+            elif score >= 40:
+                bar_color = "🟡"
+            elif score >= 25:
+                bar_color = "🟠"
+            else:
+                bar_color = "🔴"
+
+            with st.container(border=True):
+                # 标题行
+                st.markdown(f"**{r['代码']}** {r['名称']}")
+                st.caption(f"最新价: {r['最新价']}")
+
+                # 估值行
+                st.markdown(
+                    f"估值: **{r['估值区间']}**　"
+                    f"PE分位: {r['PE分位']:.1f}%　"
+                    f"PB分位: {r['PB分位']:.1f}%"
+                    if r['PE分位'] is not None and r['PB分位'] is not None
+                    else f"估值: **{r['估值区间']}**"
+                )
+
+                # 技术指标行
+                st.markdown(
+                    f"趋势: {r['趋势']} | MACD: {r['MACD']} | KDJ: {r['KDJ']}"
+                )
+                st.markdown(
+                    f"RSI: {r['RSI']} ({r['RSI信号']}) | 量价: {r['量价信号']}"
+                )
+                if r["最大回撤"] != "—":
+                    st.caption(f"最大回撤: {r['最大回撤']}")
+
+                # 评分条
+                st.progress(score / 100, text=f"{bar_color} 评分: {score}/100")
+                st.caption(r["建议"])
+
+    # 清除按钮
+    if st.button("🗑️ 清除批量结果"):
+        st.session_state.batch_codes = []
+        st.session_state.batch_results = None
+        st.rerun()
+
+    st.markdown("---")
 
 # ---- 标签页 ----
 tabs = st.tabs(["🔍 单股分析", "📋 批量分析", "🎯 低估筛选", "⭐ 自选股看板"])
