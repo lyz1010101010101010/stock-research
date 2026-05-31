@@ -81,8 +81,17 @@ def _save_watchlist(codes: list):
 # ==================== 缓存数据获取 ====================
 @st.cache_data(ttl=30, show_spinner=False)
 def _fetch_spot_em():
-    """全市场实时行情 —— 缓存 30 秒"""
-    return ak.stock_zh_a_spot_em()
+    """全市场实时行情 —— 缓存 30 秒，带 3 次重试"""
+    for i in range(3):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            if i == 2:
+                return None
+            _time.sleep(2)
+    return None
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -783,18 +792,17 @@ with tabs[3]:
     if not wl:
         st.info("👆 请先输入自选股代码并点击「💾 保存自选」")
     else:
-        # 获取实时行情（容错）
+        # 获取实时行情（容错 + 重试）
         spot_df = None
-        spot_error = None
         try:
             spot_df = _fetch_spot_em()
-        except Exception as e:
-            spot_error = str(e)
+        except Exception:
+            spot_df = None
 
-        if spot_error:
-            st.warning(f"⚠️ 实时行情获取失败: {spot_error}")
+        if spot_df is None or spot_df.empty:
+            st.warning("⚠️ 实时行情获取失败（可能非交易时间或服务受限），已跳过")
 
-        if spot_df is not None:
+        if spot_df is not None and not spot_df.empty:
             # 匹配自选股
             matched = spot_df[spot_df["代码"].isin(wl)].copy()
             if matched.empty:
