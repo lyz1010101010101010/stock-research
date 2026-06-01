@@ -18,6 +18,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import streamlit as st
 import pandas as pd
 import numpy as np
+from datetime import datetime
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ---------- 现有模块 ----------
 from main import analyze_stock
@@ -609,6 +613,162 @@ def ai_comment(name: str, code: str, info: dict, score: int) -> str:
     return pool[hash(code + "low") % len(pool)]
 
 
+# ==================== Plotly K线 + 四维共振 ====================
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_kline_data(code: str) -> pd.DataFrame | None:
+    """
+    获取全周期日线 K 线数据（2018-01-01 至今）。
+    使用 akshare stock_zh_a_hist 接口，返回统一英文列名。
+    """
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=code,
+            period="daily",
+            start_date="20180101",
+            end_date=datetime.today().strftime("%Y%m%d"),
+            adjust="qfq",
+        )
+        if df is None or df.empty:
+            return None
+        col_map = {
+            "日期": "date", "开盘": "open", "收盘": "close",
+            "最高": "high", "最低": "low", "成交量": "volume",
+            "成交额": "amount", "涨跌幅": "pct_chg",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        for col in ["open", "close", "high", "low", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception:
+        return None
+
+
+def _resonance_numeric(resonance: dict) -> dict:
+    """
+    将四维共振文字字典转为数值状态字典。
+    返回 {"趋势": 1/-1/0, "量能": 1/-1/0, "中期": 1/-1/0, "短期": 1/-1/0}
+      1 = 偏多 / 放量 / 走强
+     -1 = 偏空 / 缩量 / 走弱
+      0 = 中性
+    """
+    if not resonance:
+        return {"趋势": 0, "量能": 0, "中期": 0, "短期": 0}
+    _MAP = {
+        "趋势": {"🟢 多头": 1, "🔴 空头": -1, "🟡 震荡": 0},
+        "量能": {"🔥 放量": 1, "❄️ 缩量": -1, "⚪ 量能异常": 0},
+        "中期": {"🟢 中期走强": 1, "🔴 中期走弱": -1, "⚪ 平衡": 0},
+        "短期": {"🟢 偏多": 1, "🔴 偏空": -1, "⚪ 震荡": 0},
+    }
+    return {k: _MAP.get(k, {}).get(resonance.get(k, ""), 0)
+            for k in ["趋势", "量能", "中期", "短期"]}
+
+
+def _plot_kline_with_resonance(code: str) -> go.Figure | None:
+    """
+    绘制带四维共振横条的 K 线图（Plotly）。
+
+    - 上方：Candlestick + MA20 / MA60
+    - 下方：四个横向色块表示趋势 / 量能 / 中期 / 短期
+    """
+    df = _fetch_kline_data(code)
+    if df is None or df.empty or len(df) < 20:
+        return None
+
+    resonance = calc_resonance(code)
+    num_state = _resonance_numeric(resonance)
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        row_heights=[0.85, 0.15],
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+    )
+
+    # ── Row 1: Candlestick ──
+    fig.add_trace(
+        go.Candlestick(
+            x=df["date"],
+            open=df["open"], high=df["high"],
+            low=df["low"], close=df["close"],
+            name="K线",
+            increasing_line_color="#ef5350",
+            decreasing_line_color="#26a69a",
+        ),
+        row=1, col=1,
+    )
+
+    # MA20 / MA60
+    for period, color, width in [(20, "#ff9800", 1.2), (60, "#1565c0", 1.0)]:
+        ma = df["close"].rolling(period).mean()
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"], y=ma, mode="lines",
+                name=f"MA{period}",
+                line=dict(color=color, width=width),
+            ),
+            row=1, col=1,
+        )
+
+    fig.update_xaxes(rangeslider_visible=True, row=1, col=1)
+
+    # ── Row 2: 四维共振横条 ──
+    dims = [
+        ("趋势", num_state["趋势"]),
+        ("量能", num_state["量能"]),
+        ("中期", num_state["中期"]),
+        ("短期", num_state["短期"]),
+    ]
+    color_map = {1: "#00c853", -1: "#ff1744", 0: "#bdbdbd"}
+    label_map = {1: "↑ 偏多", -1: "↓ 偏空", 0: "— 中性"}
+
+    x_labels = [d[0] for d in dims]
+    y_vals = [1, 1, 1, 1]
+    colors = [color_map.get(d[1], "#bdbdbd") for d in dims]
+
+    fig.add_trace(
+        go.Bar(
+            x=x_labels, y=y_vals,
+            marker_color=colors,
+            text=[label_map.get(d[1], "") for d in dims],
+            textposition="inside",
+            textfont=dict(color="white", size=11),
+            width=0.55,
+            showlegend=False,
+            hovertemplate="%{x}<br>状态: %{text}<extra></extra>",
+        ),
+        row=2, col=1,
+    )
+
+    # ── Layout ──
+    stock_name = code
+    try:
+        stock_name = fetch_stock_name(code)
+    except Exception:
+        pass
+
+    fig.update_layout(
+        title=dict(
+            text=f"{code} {stock_name}  —  K线走势 & 四维共振",
+            x=0.5, font=dict(size=16),
+        ),
+        height=600,
+        hovermode="x unified",
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=60, b=20),
+        bargap=0.3,
+    )
+
+    fig.update_yaxes(title_text="价格", row=1, col=1)
+    fig.update_yaxes(visible=False, row=2, col=1)
+    fig.update_xaxes(visible=False, row=2, col=1)
+
+    return fig
+
+
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="A 股智能分析工具", page_icon="📊", layout="wide")
 st.title("📊 A 股智能分析工具")
@@ -815,20 +975,22 @@ with tabs[0]:
         code = stock_code.strip()
         with st.spinner(f"正在分析 {code}，获取行情、估值、技术指标中…"):
             try:
+                # 1. 文字报告（保持原有）
                 report = analyze_stock(code)
                 st.markdown("### 📝 分析报告")
                 st.code(report, language=None)
 
-                chart_path = os.path.join(BASE_DIR, f"chart_{code}.png")
-                val_path = os.path.join(BASE_DIR, f"valuation_{code}.png")
+                # 2. Plotly K线 + 四维共振横条
+                fig = _plot_kline_with_resonance(code)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("⚠️ K线数据不足，无法绘制")
 
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if os.path.exists(chart_path):
-                        st.image(chart_path, caption=f"{code} — 价格走势 & KDJ", use_container_width=True)
-                with col_b:
-                    if os.path.exists(val_path):
-                        st.image(val_path, caption=f"{code} — 估值历史分位", use_container_width=True)
+                # 3. 估值分位图（保持原有 PNG）
+                val_path = os.path.join(BASE_DIR, f"valuation_{code}.png")
+                if os.path.exists(val_path):
+                    st.image(val_path, caption=f"{code} — 估值历史分位", use_container_width=True)
             except Exception as e:
                 st.error(f"分析失败: {e}")
 
