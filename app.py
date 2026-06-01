@@ -161,6 +161,138 @@ def _fetch_tech_signals(symbol: str):
         return "—", "—"
 
 
+def _empty_resonance(reason: str = "⚪ 数据异常") -> dict:
+    """返回异常/空状态的共振字典"""
+    return {
+        "趋势": "⚪", "量能": "⚪", "中期": "⚪", "短期": "⚪",
+        "共振": reason, "结论": reason,
+    }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def calc_resonance(code: str) -> dict:
+    """
+    四维指标共振分析。
+
+    四维：趋势(MA20/MA60)、量能(5均量/60均量)、中期(MACD Hist)、短期(KDJ)
+    返回 dict 含：趋势/量能/中期/短期/共振/结论
+    异常或数据不足返回含 "⚪ 数据异常" 的字典
+    """
+    try:
+        df = fetch_daily_price(code)
+        if df is None or df.empty:
+            return _empty_resonance("⚪ 数据异常")
+
+        close = df["close"].astype(float)
+        volume = df["volume"].astype(float) if "volume" in df.columns else pd.Series(dtype=float)
+
+        if len(close) < 60:
+            return _empty_resonance("⚪ 数据不足")
+
+        # ── 1. 趋势维度：MA20 vs MA60 ──
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        last_close = close.iloc[-1]
+
+        if last_close > ma20.iloc[-1] > ma60.iloc[-1]:
+            trend = "🟢 多头"
+        elif last_close < ma20.iloc[-1] < ma60.iloc[-1]:
+            trend = "🔴 空头"
+        else:
+            trend = "🟡 震荡"
+
+        # ── 2. 量能维度：5日均量 vs 60日均量 ──
+        vol_ma5 = volume.rolling(5).mean()
+        vol_ma60 = volume.rolling(60).mean()
+        if pd.notna(vol_ma5.iloc[-1]) and pd.notna(vol_ma60.iloc[-1]) and vol_ma5.iloc[-1] > 0:
+            volume_dim = "🔥 放量" if vol_ma5.iloc[-1] > vol_ma60.iloc[-1] else "❄️ 缩量"
+        else:
+            volume_dim = "⚪ 量能异常"
+
+        # ── 3. 中期维度：MACD Histogram ──
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9).mean()
+        hist = macd_line - signal_line
+
+        hist_cur = hist.iloc[-1]
+        hist_prev = hist.iloc[-2] if len(hist) >= 2 else hist_cur
+
+        if hist_cur > 0 and hist_cur > hist_prev:
+            medium = "🟢 中期走强"
+        elif hist_cur < 0 and hist_cur < hist_prev:
+            medium = "🔴 中期走弱"
+        else:
+            medium = "⚪ 平衡"
+
+        # ── 4. 短期维度：KDJ(9,3,3) ──
+        high = df["high"].astype(float) if "high" in df.columns else close
+        low_val = df["low"].astype(float) if "low" in df.columns else close
+
+        low_n = low_val.rolling(9).min()
+        high_n = high.rolling(9).max()
+        denom = high_n - low_n
+        denom = denom.replace(0, np.nan)
+        rsv = (close - low_n) / denom * 100
+        k = rsv.ewm(com=2, adjust=False).mean()
+        d = k.ewm(com=2, adjust=False).mean()
+        j = 3 * k - 2 * d
+
+        k_now, d_now = k.iloc[-1], d.iloc[-1]
+        k_prev, d_prev = k.iloc[-2], d.iloc[-2]
+        j_now = j.iloc[-1]
+
+        if pd.isna(j_now):
+            short_term = "⚪ 震荡"
+        elif j_now < 20:
+            short_term = "🟢 偏多"
+        elif j_now > 80:
+            short_term = "🔴 偏空"
+        elif k_prev <= d_prev and k_now > d_now:
+            short_term = "🟢 偏多"
+        elif k_prev >= d_prev and k_now < d_now:
+            short_term = "🔴 偏空"
+        else:
+            short_term = "⚪ 震荡"
+
+        # ── 5. 共振计数 ──
+        bullish_count = sum([
+            trend == "🟢 多头",
+            volume_dim == "🔥 放量",
+            medium == "🟢 中期走强",
+            short_term == "🟢 偏多",
+        ])
+
+        if bullish_count == 4:
+            resonance = "🟢 强共振"
+            conclusion = "四维多头共振，强势特征显著"
+        elif bullish_count == 3:
+            resonance = "🟡 偏多共振"
+            conclusion = "三维偏多，整体方向向上"
+        elif bullish_count == 2:
+            resonance = "⚪ 震荡整理"
+            conclusion = "多空均衡，震荡格局"
+        elif bullish_count == 1:
+            resonance = "🔴 弱势共振"
+            conclusion = "仅一维偏多，整体弱势"
+        else:
+            resonance = "🔴 全面背离"
+            conclusion = "所有维度偏空，全面背离"
+
+        return {
+            "趋势": trend,
+            "量能": volume_dim,
+            "中期": medium,
+            "短期": short_term,
+            "共振": resonance,
+            "结论": conclusion,
+        }
+
+    except Exception:
+        return _empty_resonance("⚪ 数据异常")
+
+
 # ==================== 结构化分析（批量用） ====================
 def _analyze_stock_summary(code: str) -> dict:
     """
@@ -814,6 +946,12 @@ with tabs[3]:
                     if code in matched["代码"].values:
                         signals[code] = _fetch_tech_signals(code)
 
+                # 四维指标共振（缓存，不阻塞表格渲染）
+                resonances = {}
+                for code in wl:
+                    if code in matched["代码"].values:
+                        resonances[code] = calc_resonance(code)
+
                 # 构建展示表格
                 rows = []
                 for _, r in matched.iterrows():
@@ -834,6 +972,7 @@ with tabs[3]:
                         "成交额(亿)": amt_str,
                         "MA排列": ma_sig,
                         "KDJ信号": kdj_sig,
+                        "四维共振": resonances.get(code, {}).get("共振", "⚪ 数据异常"),
                     })
 
                 st.dataframe(
@@ -877,5 +1016,25 @@ with tabs[3]:
                             with col_b:
                                 if os.path.exists(val_path):
                                     st.image(val_path, caption="估值分位", use_container_width=True)
+
+                            # 四维共振明细
+                            r_data = calc_resonance(code)
+                            if r_data.get("共振", "") not in ("⚪ 数据异常", "⚪ 数据不足"):
+                                with st.container(border=True):
+                                    st.markdown("**📊 四维指标共振**")
+                                    rc1, rc2, rc3, rc4 = st.columns(4)
+                                    with rc1:
+                                        st.caption("趋势")
+                                        st.markdown(r_data["趋势"])
+                                    with rc2:
+                                        st.caption("量能")
+                                        st.markdown(r_data["量能"])
+                                    with rc3:
+                                        st.caption("中期(MACD)")
+                                        st.markdown(r_data["中期"])
+                                    with rc4:
+                                        st.caption("短期(KDJ)")
+                                        st.markdown(r_data["短期"])
+                                    st.success(f"**共振**: {r_data['共振']} — {r_data['结论']}")
                         except Exception as e:
                             st.error(f"分析失败: {e}")
