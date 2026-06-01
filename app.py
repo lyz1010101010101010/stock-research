@@ -343,31 +343,36 @@ def calc_resonance(code: str) -> dict:
         return _empty_resonance("⚪ 数据异常")
 
 
-# 四维状态 → 彩色圆点映射表
-_DIM_LIGHT_MAP = {
-    "趋势": {"🟢 多头": "🟢", "🔴 空头": "🔴", "🟡 震荡": "⚪"},
-    "量能": {"🔥 放量": "🟢", "❄️ 缩量": "🔴", "⚪ 量能异常": "⚪"},
-    "中期": {"🟢 中期走强": "🟢", "🔴 中期走弱": "🔴", "⚪ 平衡": "⚪"},
-    "短期": {"🟢 偏多": "🟢", "🔴 偏空": "🔴", "⚪ 震荡": "⚪"},
-    "量能异常": {"⚪ 量能异常": "⚪"},  # fallback
+# 四维状态 → 彩色圆点映射（关键词 → emoji 圆点）
+_DIM_LIGHT_KEYWORDS = {
+    "趋势": ("多头", "空头", "🟢", "🔴", "🟡"),
+    "量能": ("放量", "缩量", "🔥", "❄️", "⚪"),
+    "中期": ("走强", "走弱", "🟢", "🔴", "⚪"),
+    "短期": ("偏多", "偏空", "🟢", "🔴", "⚪"),
 }
 
 
 def _resonance_lights(resonance: dict) -> str:
     """
     将四维共振字典转为四色圆点字符串（用于表格列显示）。
+    使用关键词匹配，避免 emoji Unicode 差异。
 
     例:
         resonance = {"趋势":"🟢 多头","量能":"🔥 放量","中期":"⚪ 平衡","短期":"🔴 偏空"}
-        → "🟢 🟢 ⚪ 🔴"
+        → "🟢 🔥 ⚪ 🔴"
     """
     if not resonance or resonance.get("共振", "") in ("⚪ 数据异常", "⚪ 数据不足"):
         return "⬜ ⬜ ⬜ ⬜"
     parts = []
     for key in ("趋势", "量能", "中期", "短期"):
-        val = resonance.get(key, "")
-        mapped = _DIM_LIGHT_MAP.get(key, {}).get(val, "⚪")
-        parts.append(mapped)
+        v = resonance.get(key, "")
+        pos_kw, neg_kw, pos_emoji, neg_emoji, neutral_emoji = _DIM_LIGHT_KEYWORDS[key]
+        if pos_kw in v:
+            parts.append(pos_emoji)
+        elif neg_kw in v:
+            parts.append(neg_emoji)
+        else:
+            parts.append(neutral_emoji)
     return " ".join(parts)
 
 
@@ -625,7 +630,7 @@ def _fetch_kline_data(code: str) -> pd.DataFrame | None:
         df = ak.stock_zh_a_hist(
             symbol=code,
             period="daily",
-            start_date="20180101",
+            start_date="19900101",
             end_date=datetime.today().strftime("%Y%m%d"),
             adjust="qfq",
         )
