@@ -79,9 +79,19 @@ def _save_watchlist(codes: list):
 
 
 # ==================== 缓存数据获取 ====================
+
+# 实时行情 DataFrame 标准列名（用于兜底空表）
+_SPOT_COLUMNS = ["代码", "名称", "最新价", "涨跌幅", "成交额"]
+
+
+def _empty_spot_df() -> pd.DataFrame:
+    """返回空行情 DataFrame（统一表头）"""
+    return pd.DataFrame(columns=_SPOT_COLUMNS)
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _fetch_spot_em():
-    """全市场实时行情 —— 缓存 30 秒，带 3 次重试"""
+    """全市场实时行情 —— 缓存 30 秒，带 3 次重试，失败返回空 DataFrame"""
     for i in range(3):
         try:
             df = ak.stock_zh_a_spot_em()
@@ -89,9 +99,9 @@ def _fetch_spot_em():
                 return df
         except Exception:
             if i == 2:
-                return None
+                return _empty_spot_df()
             _time.sleep(2)
-    return None
+    return _empty_spot_df()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -924,117 +934,128 @@ with tabs[3]:
     if not wl:
         st.info("👆 请先输入自选股代码并点击「💾 保存自选」")
     else:
-        # 获取实时行情（容错 + 重试）
-        spot_df = None
-        try:
-            spot_df = _fetch_spot_em()
-        except Exception:
-            spot_df = None
+        # 获取实时行情（兜底：失败返回空 DataFrame）
+        spot_df = _fetch_spot_em()
 
-        if spot_df is None or spot_df.empty:
-            st.warning("⚠️ 实时行情获取失败（可能非交易时间或服务受限），已跳过")
-
-        if spot_df is not None and not spot_df.empty:
-            # 匹配自选股
+        if spot_df.empty:
+            st.warning("⚠️ 实时行情获取失败，已使用历史数据展示")
+            # 基于 watchlist 构建兜底数据
+            fallback_rows = []
+            for code in wl:
+                try:
+                    df_price = fetch_daily_price(code)
+                    price = float(df_price["close"].iloc[-1]) if df_price is not None and not df_price.empty else 0.0
+                except Exception:
+                    price = 0.0
+                try:
+                    name = fetch_stock_name(code)
+                except Exception:
+                    name = code
+                fallback_rows.append({
+                    "代码": code, "名称": name, "最新价": price,
+                    "涨跌幅": 0.0, "成交额": None,
+                })
+            matched = pd.DataFrame(fallback_rows)
+        else:
             matched = spot_df[spot_df["代码"].isin(wl)].copy()
             if matched.empty:
                 st.warning("未能在实时行情中匹配到自选股代码")
-            else:
-                # 获取每只自选股的技术信号
-                signals = {}
-                for code in wl:
-                    if code in matched["代码"].values:
-                        signals[code] = _fetch_tech_signals(code)
 
-                # 四维指标共振（缓存，不阻塞表格渲染）
-                resonances = {}
-                for code in wl:
-                    if code in matched["代码"].values:
-                        resonances[code] = calc_resonance(code)
+        if not matched.empty:
+            # 获取每只自选股的技术信号
+            signals = {}
+            for code in wl:
+                if code in matched["代码"].values:
+                    signals[code] = _fetch_tech_signals(code)
 
-                # 构建展示表格
-                rows = []
-                for _, r in matched.iterrows():
-                    code = r["代码"]
-                    pct = r.get("涨跌幅", 0)
-                    pct = float(pct) if pd.notna(pct) else 0.0
-                    amount = r.get("成交额", None)
-                    amt_str = f"{amount / 1e8:.2f}亿" if pd.notna(amount) and amount else "—"
+            # 四维指标共振（缓存，不阻塞表格渲染）
+            resonances = {}
+            for code in wl:
+                if code in matched["代码"].values:
+                    resonances[code] = calc_resonance(code)
 
-                    emoji = "🔴" if pct < -0.01 else ("🟢" if pct > 0.01 else "➖")
-                    ma_sig, kdj_sig = signals.get(code, ("—", "—"))
+            # 构建展示表格
+            rows = []
+            for _, r in matched.iterrows():
+                code = r["代码"]
+                pct = float(r.get("涨跌幅", 0)) if pd.notna(r.get("涨跌幅", None)) else 0.0
+                amount = r.get("成交额", None)
+                amt_str = f"{amount / 1e8:.2f}亿" if pd.notna(amount) and amount else "—"
 
-                    rows.append({
-                        "代码": code,
-                        "名称": r.get("名称", code),
-                        "最新价": f"{r.get('最新价', 0):.2f}",
-                        "涨跌幅": f"{emoji} {pct:+.2f}%",
-                        "成交额(亿)": amt_str,
-                        "MA排列": ma_sig,
-                        "KDJ信号": kdj_sig,
-                        "四维共振": resonances.get(code, {}).get("共振", "⚪ 数据异常"),
-                    })
+                emoji = "🔴" if pct < -0.01 else ("🟢" if pct > 0.01 else "➖")
+                ma_sig, kdj_sig = signals.get(code, ("—", "—"))
 
-                st.dataframe(
-                    pd.DataFrame(rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                rows.append({
+                    "代码": code,
+                    "名称": r.get("名称", code),
+                    "最新价": f"{r.get('最新价', 0):.2f}",
+                    "涨跌幅": f"{emoji} {pct:+.2f}%",
+                    "成交额(亿)": amt_str,
+                    "MA排列": ma_sig,
+                    "KDJ信号": kdj_sig,
+                    "四维共振": resonances.get(code, {}).get("共振", "⚪ 数据异常"),
+                })
 
-                # 选中某只 → 补算完整技术信号（显示更多细节）
-                st.markdown("---")
-                detail_code = st.selectbox(
-                    "选择股票查看详情或跳转分析",
-                    [c for c in wl if c in matched["代码"].values],
-                    key="detail_select",
-                )
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-                col_d1, col_d2 = st.columns([1, 3])
-                with col_d1:
-                    if st.button("🔍 跳转单股分析", use_container_width=True):
-                        st.session_state.jump_code = detail_code
-                        st.success(f"✅ 已选定 {detail_code}，请切换到 **【单股分析】** Tab 查看完整报告")
+            # 选中某只 → 补算完整技术信号（显示更多细节）
+            st.markdown("---")
+            detail_code = st.selectbox(
+                "选择股票查看详情或跳转分析",
+                [c for c in wl if c in matched["代码"].values],
+                key="detail_select",
+            )
 
-                with col_d2:
-                    if st.button("📊 内联展开简版", use_container_width=True):
-                        st.session_state.pop("_inline_code", None)  # 切换展开
-                        st.session_state._inline_code = detail_code
+            col_d1, col_d2 = st.columns([1, 3])
+            with col_d1:
+                if st.button("🔍 跳转单股分析", use_container_width=True):
+                    st.session_state.jump_code = detail_code
+                    st.success(f"✅ 已选定 {detail_code}，请切换到 **【单股分析】** Tab 查看完整报告")
 
-                if st.session_state.get("_inline_code"):
-                    code = st.session_state._inline_code
-                    with st.expander(f"📈 [{code}] 简版分析", expanded=True):
-                        try:
-                            report = analyze_stock(code)
-                            st.code(report, language=None)
+            with col_d2:
+                if st.button("📊 内联展开简版", use_container_width=True):
+                    st.session_state.pop("_inline_code", None)  # 切换展开
+                    st.session_state._inline_code = detail_code
 
-                            chart_path = os.path.join(BASE_DIR, f"chart_{code}.png")
-                            val_path = os.path.join(BASE_DIR, f"valuation_{code}.png")
-                            col_a, col_b = st.columns(2)
-                            with col_a:
-                                if os.path.exists(chart_path):
-                                    st.image(chart_path, caption="走势图", use_container_width=True)
-                            with col_b:
-                                if os.path.exists(val_path):
-                                    st.image(val_path, caption="估值分位", use_container_width=True)
+            if st.session_state.get("_inline_code"):
+                code = st.session_state._inline_code
+                with st.expander(f"📈 [{code}] 简版分析", expanded=True):
+                    try:
+                        report = analyze_stock(code)
+                        st.code(report, language=None)
 
-                            # 四维共振明细
-                            r_data = calc_resonance(code)
-                            if r_data.get("共振", "") not in ("⚪ 数据异常", "⚪ 数据不足"):
-                                with st.container(border=True):
-                                    st.markdown("**📊 四维指标共振**")
-                                    rc1, rc2, rc3, rc4 = st.columns(4)
-                                    with rc1:
-                                        st.caption("趋势")
-                                        st.markdown(r_data["趋势"])
-                                    with rc2:
-                                        st.caption("量能")
-                                        st.markdown(r_data["量能"])
-                                    with rc3:
-                                        st.caption("中期(MACD)")
-                                        st.markdown(r_data["中期"])
-                                    with rc4:
-                                        st.caption("短期(KDJ)")
-                                        st.markdown(r_data["短期"])
-                                    st.success(f"**共振**: {r_data['共振']} — {r_data['结论']}")
-                        except Exception as e:
-                            st.error(f"分析失败: {e}")
+                        chart_path = os.path.join(BASE_DIR, f"chart_{code}.png")
+                        val_path = os.path.join(BASE_DIR, f"valuation_{code}.png")
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            if os.path.exists(chart_path):
+                                st.image(chart_path, caption="走势图", use_container_width=True)
+                        with col_b:
+                            if os.path.exists(val_path):
+                                st.image(val_path, caption="估值分位", use_container_width=True)
+
+                        # 四维共振明细
+                        r_data = calc_resonance(code)
+                        if r_data.get("共振", "") not in ("⚪ 数据异常", "⚪ 数据不足"):
+                            with st.container(border=True):
+                                st.markdown("**📊 四维指标共振**")
+                                rc1, rc2, rc3, rc4 = st.columns(4)
+                                with rc1:
+                                    st.caption("趋势")
+                                    st.markdown(r_data["趋势"])
+                                with rc2:
+                                    st.caption("量能")
+                                    st.markdown(r_data["量能"])
+                                with rc3:
+                                    st.caption("中期(MACD)")
+                                    st.markdown(r_data["中期"])
+                                with rc4:
+                                    st.caption("短期(KDJ)")
+                                    st.markdown(r_data["短期"])
+                                st.success(f"**共振**: {r_data['共振']} — {r_data['结论']}")
+                    except Exception as e:
+                        st.error(f"分析失败: {e}")
