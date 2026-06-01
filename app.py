@@ -6,7 +6,7 @@ A 股智能分析工具 —— Streamlit Web 应用
     streamlit run app.py
 
 依赖:
-    pip install streamlit akshare pandas numpy matplotlib
+    pip install streamlit akshare pandas numpy matplotlib plotly
 """
 
 import sys
