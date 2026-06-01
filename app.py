@@ -80,8 +80,8 @@ def _save_watchlist(codes: list):
 
 # ==================== 缓存数据获取 ====================
 
-# 实时行情 DataFrame 标准列名（用于兜底空表）
-_SPOT_COLUMNS = ["代码", "名称", "最新价", "涨跌幅", "成交额"]
+# 实时行情 DataFrame 标准列名（成功或降级后统一输出）
+_SPOT_COLUMNS = ["代码", "名称", "最新价", "涨跌幅", "成交额(亿)"]
 
 
 def _empty_spot_df() -> pd.DataFrame:
@@ -90,17 +90,53 @@ def _empty_spot_df() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def _fetch_spot_em():
-    """全市场实时行情 —— 缓存 30 秒，带 3 次重试，失败返回空 DataFrame"""
+def _fetch_spot_em(codes: list | None = None):
+    """
+    全市场实时行情 —— 带 3 次重试 + 降级兜底。
+
+    优先调用 ak.stock_zh_a_spot_em() 获取实时全市场行情。
+    若失败（异常 / 空），且提供了 codes 参数，则降级为:
+      对每只股票调用 fetch_daily_price(code) 获取最新日线收盘价。
+
+    返回 DataFrame 列：["代码", "名称", "最新价", "涨跌幅", "成交额(亿)"]
+    """
     for i in range(3):
         try:
             df = ak.stock_zh_a_spot_em()
             if df is not None and not df.empty:
-                return df
+                # 统一列：成交额(亿)
+                if "成交额" in df.columns:
+                    df["成交额(亿)"] = pd.to_numeric(df["成交额"], errors="coerce") / 1e8
+                    df.drop(columns=["成交额"], inplace=True)
+                else:
+                    df["成交额(亿)"] = None
+                # 确保仅保留标准列
+                out_cols = [c for c in _SPOT_COLUMNS if c in df.columns]
+                return df[out_cols]
         except Exception:
             if i == 2:
-                return _empty_spot_df()
+                break
             _time.sleep(2)
+
+    # ── 降级：基于日线收盘价构建 ──
+    if codes:
+        rows = []
+        for code in codes:
+            try:
+                df_price = fetch_daily_price(code)
+                close_val = float(df_price["close"].iloc[-1]) if df_price is not None and not df_price.empty else 0.0
+            except Exception:
+                close_val = 0.0
+            try:
+                name = fetch_stock_name(code)
+            except Exception:
+                name = code
+            rows.append({
+                "代码": code, "名称": name, "最新价": close_val,
+                "涨跌幅": 0.0, "成交额(亿)": None,
+            })
+        return pd.DataFrame(rows, columns=_SPOT_COLUMNS)
+
     return _empty_spot_df()
 
 
@@ -301,6 +337,34 @@ def calc_resonance(code: str) -> dict:
 
     except Exception:
         return _empty_resonance("⚪ 数据异常")
+
+
+# 四维状态 → 彩色圆点映射表
+_DIM_LIGHT_MAP = {
+    "趋势": {"🟢 多头": "🟢", "🔴 空头": "🔴", "🟡 震荡": "⚪"},
+    "量能": {"🔥 放量": "🟢", "❄️ 缩量": "🔴", "⚪ 量能异常": "⚪"},
+    "中期": {"🟢 中期走强": "🟢", "🔴 中期走弱": "🔴", "⚪ 平衡": "⚪"},
+    "短期": {"🟢 偏多": "🟢", "🔴 偏空": "🔴", "⚪ 震荡": "⚪"},
+    "量能异常": {"⚪ 量能异常": "⚪"},  # fallback
+}
+
+
+def _resonance_lights(resonance: dict) -> str:
+    """
+    将四维共振字典转为四色圆点字符串（用于表格列显示）。
+
+    例:
+        resonance = {"趋势":"🟢 多头","量能":"🔥 放量","中期":"⚪ 平衡","短期":"🔴 偏空"}
+        → "🟢 🟢 ⚪ 🔴"
+    """
+    if not resonance or resonance.get("共振", "") in ("⚪ 数据异常", "⚪ 数据不足"):
+        return "⬜ ⬜ ⬜ ⬜"
+    parts = []
+    for key in ("趋势", "量能", "中期", "短期"):
+        val = resonance.get(key, "")
+        mapped = _DIM_LIGHT_MAP.get(key, {}).get(val, "⚪")
+        parts.append(mapped)
+    return " ".join(parts)
 
 
 # ==================== 结构化分析（批量用） ====================
@@ -934,32 +998,14 @@ with tabs[3]:
     if not wl:
         st.info("👆 请先输入自选股代码并点击「💾 保存自选」")
     else:
-        # 获取实时行情（兜底：失败返回空 DataFrame）
-        spot_df = _fetch_spot_em()
+        # 获取实时行情（带降级兜底）
+        spot_df = _fetch_spot_em(wl)
 
-        if spot_df.empty:
-            st.warning("⚠️ 实时行情获取失败，已使用历史数据展示")
-            # 基于 watchlist 构建兜底数据
-            fallback_rows = []
-            for code in wl:
-                try:
-                    df_price = fetch_daily_price(code)
-                    price = float(df_price["close"].iloc[-1]) if df_price is not None and not df_price.empty else 0.0
-                except Exception:
-                    price = 0.0
-                try:
-                    name = fetch_stock_name(code)
-                except Exception:
-                    name = code
-                fallback_rows.append({
-                    "代码": code, "名称": name, "最新价": price,
-                    "涨跌幅": 0.0, "成交额": None,
-                })
-            matched = pd.DataFrame(fallback_rows)
-        else:
-            matched = spot_df[spot_df["代码"].isin(wl)].copy()
-            if matched.empty:
-                st.warning("未能在实时行情中匹配到自选股代码")
+        matched = spot_df[spot_df["代码"].isin(wl)].copy() if not spot_df.empty else pd.DataFrame()
+        if matched.empty:
+            st.warning("未能在实时行情中匹配到自选股代码")
+        elif len(spot_df) <= len(wl) and len(wl) > 0:
+            st.warning("⚠️ 实时行情获取失败，已使用历史收盘价展示，四维共振基于最近交易日计算")
 
         if not matched.empty:
             # 获取每只自选股的技术信号
@@ -979,8 +1025,8 @@ with tabs[3]:
             for _, r in matched.iterrows():
                 code = r["代码"]
                 pct = float(r.get("涨跌幅", 0)) if pd.notna(r.get("涨跌幅", None)) else 0.0
-                amount = r.get("成交额", None)
-                amt_str = f"{amount / 1e8:.2f}亿" if pd.notna(amount) and amount else "—"
+                amount_亿 = r.get("成交额(亿)", None)
+                amt_str = f"{amount_亿:.2f}亿" if pd.notna(amount_亿) else "—"
 
                 emoji = "🔴" if pct < -0.01 else ("🟢" if pct > 0.01 else "➖")
                 ma_sig, kdj_sig = signals.get(code, ("—", "—"))
@@ -993,7 +1039,7 @@ with tabs[3]:
                     "成交额(亿)": amt_str,
                     "MA排列": ma_sig,
                     "KDJ信号": kdj_sig,
-                    "四维共振": resonances.get(code, {}).get("共振", "⚪ 数据异常"),
+                    "四维共振": _resonance_lights(resonances.get(code, {})),
                 })
 
             st.dataframe(
