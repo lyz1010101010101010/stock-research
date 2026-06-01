@@ -67,6 +67,143 @@ _setup_chinese_font()
 
 # ==================== 内部工具 ====================
 
+def _calc_resonance_states(df: pd.DataFrame) -> dict | None:
+    """
+    计算四维指标状态（用于共振子图绘制）。
+    返回 {trend, volume, medium, short} 各维度的数值状态：
+      1 = 强（多头/放量/走强/偏多）
+      0 = 中性（震荡/平衡）
+     -1 = 弱（空头/缩量/走弱/偏空）
+    数据不足 60 周期或异常返回 None。
+    """
+    try:
+        close = df["close"].astype(float)
+        volume = df["volume"].astype(float) if "volume" in df.columns else pd.Series(dtype=float)
+        high = df["high"].astype(float) if "high" in df.columns else close
+        low = df["low"].astype(float) if "low" in df.columns else close
+
+        if len(close) < 60:
+            return None
+
+        # ── 1. 趋势 ──
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        last_close = close.iloc[-1]
+
+        if last_close > ma20.iloc[-1] > ma60.iloc[-1]:
+            trend = 1
+        elif last_close < ma20.iloc[-1] < ma60.iloc[-1]:
+            trend = -1
+        else:
+            trend = 0
+
+        # ── 2. 量能 ──
+        vol_ma5 = volume.rolling(5).mean()
+        vol_ma60 = volume.rolling(60).mean()
+        if pd.notna(vol_ma5.iloc[-1]) and pd.notna(vol_ma60.iloc[-1]) and vol_ma5.iloc[-1] > 0:
+            vol_state = 1 if vol_ma5.iloc[-1] > vol_ma60.iloc[-1] else -1
+        else:
+            vol_state = 0
+
+        # ── 3. 中期 (MACD Hist) ──
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9).mean()
+        hist = macd_line - signal_line
+        hist_cur = hist.iloc[-1]
+        hist_prev = hist.iloc[-2] if len(hist) >= 2 else hist_cur
+
+        if hist_cur > 0 and hist_cur > hist_prev:
+            medium = 1
+        elif hist_cur < 0 and hist_cur < hist_prev:
+            medium = -1
+        else:
+            medium = 0
+
+        # ── 4. 短期 (KDJ) ──
+        low_n = low.rolling(9).min()
+        high_n = high.rolling(9).max()
+        denom = high_n - low_n
+        denom = denom.replace(0, np.nan)
+        rsv = (close - low_n) / denom * 100
+        k = rsv.ewm(com=2, adjust=False).mean()
+        d = k.ewm(com=2, adjust=False).mean()
+        j = 3 * k - 2 * d
+
+        j_now = j.iloc[-1]
+        if pd.isna(j_now):
+            short = 0
+        elif j_now < 20:
+            short = 1
+        elif j_now > 80:
+            short = -1
+        elif k.iloc[-2] <= d.iloc[-2] and k.iloc[-1] > d.iloc[-1]:
+            short = 1
+        elif k.iloc[-2] >= d.iloc[-2] and k.iloc[-1] < d.iloc[-1]:
+            short = -1
+        else:
+            short = 0
+
+        return {"trend": trend, "volume": vol_state, "medium": medium, "short": short}
+    except Exception:
+        return None
+
+
+def _draw_resonance_panel(ax, states: dict):
+    """在 Axes 上绘制四维共振子图：四个横向矩形色块 + 标签"""
+    if states is None:
+        ax.text(0.5, 0.5, "四维共振：数据不足", transform=ax.transAxes,
+                ha="center", va="center", fontsize=11, color="gray")
+        ax.axis("off")
+        return
+
+    dims = [
+        ("趋势", states.get("trend", 0)),
+        ("量能", states.get("volume", 0)),
+        ("中期", states.get("medium", 0)),
+        ("短期", states.get("short", 0)),
+    ]
+    colors = {1: "#2ecc71", 0: "#95a5a6", -1: "#e74c3c"}
+    state_labels = {1: "↑ 偏多", 0: "— 中性", -1: "↓ 偏空"}
+
+    y_pos = list(range(len(dims)))
+    bar_colors = [colors.get(s, "#95a5a6") for _, s in dims]
+
+    # 横向色条
+    for i, (_, s) in enumerate(dims):
+        c = colors.get(s, "#95a5a6")
+        ax.barh(i, 1, height=0.45, left=0, color=c, alpha=0.85,
+                edgecolor="white", linewidth=1.2, zorder=3)
+
+    # 维度名称（左侧）
+    for i, (name, _) in enumerate(dims):
+        ax.text(-0.15, i, name, ha="right", va="center", fontsize=9,
+                fontweight="bold", transform=ax.get_yaxis_transform())
+
+    # 状态文字（色条右侧）
+    for i, (_, s) in enumerate(dims):
+        ax.text(1.08, i, state_labels.get(s, ""), va="center", fontsize=8,
+                color=colors.get(s, "#95a5a6"), fontweight="bold",
+                transform=ax.get_yaxis_transform())
+
+    # 计数汇总
+    strong = sum(1 for _, s in dims if s == 1)
+    weak = sum(1 for _, s in dims if s == -1)
+    neutral = 4 - strong - weak
+    ax.text(0.5, -0.45, f"强 {strong}  中 {neutral}  弱 {weak}",
+            ha="center", va="top", fontsize=8, color="#555555",
+            transform=ax.transAxes)
+
+    ax.set_xlim(0, 2.5)
+    ax.set_ylim(-0.5, 3.5)
+    ax.set_title("四维指标共振", fontsize=10, fontweight="bold", pad=4, color="#2c3e50")
+    ax.set_yticks([])
+    ax.set_xticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
 def _calc_kdj_series(df: pd.DataFrame):
     """
     计算完整 KDJ 序列（用于绘图，复刻 momentum.py 中的算法）。
@@ -126,10 +263,11 @@ def plot_price_kdj(
     save_dir: Optional[str] = None,
 ) -> str:
     """
-    生成「价格走势 + KDJ 指标」双面板图。
+    生成「价格走势 + KDJ + 四维共振」三面板图。
 
     上方：收盘价 + MA 均线 + 支撑/压力线 + 买卖点标注
-    下方：KDJ (K / D / J) 指标，含超买(80) / 超卖(20) 参考线
+    中间：KDJ (K / D / J) 指标，含超买(80) / 超卖(20) 参考线
+    下方：四维指标共振子图（趋势 / 量能 / 中期 / 短期 状态色块）
 
     参数
     -----
@@ -186,8 +324,8 @@ def plot_price_kdj(
     dif_series, dea_series, hist_series = _calc_macd_series(df)
 
     # ---------- 创建图形 ----------
-    fig = plt.figure(figsize=(18, 10))
-    gs = GridSpec(2, 1, height_ratios=[3, 1], hspace=0.06)
+    fig = plt.figure(figsize=(18, 10.5))
+    gs = GridSpec(3, 1, height_ratios=[3, 1.2, 0.55], hspace=0.08)
 
     # ===== 上方面板：价格 + 均线 + 支撑/压力 + 买卖点 =====
     ax1 = fig.add_subplot(gs[0])
@@ -382,6 +520,11 @@ def plot_price_kdj(
     ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     fig.autofmt_xdate(rotation=35, ha="right")
+
+    # ===== 第三面板：四维共振 =====
+    ax3 = fig.add_subplot(gs[2])
+    states = _calc_resonance_states(df)
+    _draw_resonance_panel(ax3, states)
 
     # 紧缩 layout → 保存
     fig.tight_layout()
