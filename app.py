@@ -650,6 +650,7 @@ def _fetch_kline_data(code: str) -> pd.DataFrame | None:
 def _resonance_numeric(resonance: dict) -> dict:
     """
     将四维共振文字字典转为数值状态字典。
+    使用关键词匹配，避免 emoji Unicode 比较差异。
     返回 {"趋势": 1/-1/0, "量能": 1/-1/0, "中期": 1/-1/0, "短期": 1/-1/0}
       1 = 偏多 / 放量 / 走强
      -1 = 偏空 / 缩量 / 走弱
@@ -657,14 +658,17 @@ def _resonance_numeric(resonance: dict) -> dict:
     """
     if not resonance:
         return {"趋势": 0, "量能": 0, "中期": 0, "短期": 0}
-    _MAP = {
-        "趋势": {"🟢 多头": 1, "🔴 空头": -1, "🟡 震荡": 0},
-        "量能": {"🔥 放量": 1, "❄️ 缩量": -1, "⚪ 量能异常": 0},
-        "中期": {"🟢 中期走强": 1, "🔴 中期走弱": -1, "⚪ 平衡": 0},
-        "短期": {"🟢 偏多": 1, "🔴 偏空": -1, "⚪ 震荡": 0},
+
+    def _val(key: str, pos: str, neg: str) -> int:
+        v = resonance.get(key, "")
+        return 1 if pos in v else (-1 if neg in v else 0)
+
+    return {
+        "趋势": _val("趋势", "多头", "空头"),
+        "量能": _val("量能", "放量", "缩量"),
+        "中期": _val("中期", "走强", "走弱"),
+        "短期": _val("短期", "偏多", "偏空"),
     }
-    return {k: _MAP.get(k, {}).get(resonance.get(k, ""), 0)
-            for k in ["趋势", "量能", "中期", "短期"]}
 
 
 def _plot_kline_with_resonance(code: str) -> go.Figure | None:
@@ -713,7 +717,14 @@ def _plot_kline_with_resonance(code: str) -> go.Figure | None:
             row=1, col=1,
         )
 
-    fig.update_xaxes(rangeslider_visible=True, row=1, col=1)
+    # 设置 x 轴范围覆盖全部数据，确保走势完整显示
+    date_min = df["date"].min()
+    date_max = df["date"].max()
+    fig.update_xaxes(
+        range=[date_min, date_max],
+        rangeslider_visible=True,
+        row=1, col=1,
+    )
 
     # ── Row 2: 四维共振横条 ──
     dims = [
