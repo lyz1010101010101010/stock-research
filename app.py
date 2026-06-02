@@ -23,6 +23,8 @@ from main import analyze_stock
 from screen import screen_stocks
 
 import akshare as ak
+import baostock as bs
+import atexit
 from data.fetch_price import fetch_daily_price
 from data.fetch_fundamental import fetch_stock_name
 
@@ -43,6 +45,27 @@ def _patched_get(*args, **kwargs):
     return _orig_get(*args, **kwargs)
 
 _requests.get = _patched_get
+
+# ==================== Baostock 初始化 ====================
+_BS_READY = False
+
+def _init_bs():
+    """一次性初始化 baostock 登录，Streamlit 进程生命周期内有效"""
+    global _BS_READY
+    if not _BS_READY:
+        try:
+            lg = bs.login()
+            if lg.error_code == '0':
+                _BS_READY = True
+                atexit.register(bs.logout)
+        except Exception:
+            pass
+
+def _to_bs_code(code: str) -> str:
+    """将 6 位数字代码转为 baostock 格式（sh.600519 / sz.000001）"""
+    code = code.strip()
+    return f"sh.{code}" if code.startswith("6") else f"sz.{code}"
+
 
 # ==================== 常量 ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -191,18 +214,54 @@ def calc_daily_resonance(df: pd.DataFrame) -> pd.DataFrame:
 # ==================== K线 + 四维共振（全历史 + 逐日交互） ====================
 @st.cache_data(ttl=600, show_spinner=False)
 def _fetch_kline(code):
-    """获取全历史日线，返回带英文别名的 DataFrame"""
-    df = ak.stock_zh_a_hist(code, "daily", "19900101", datetime.today().strftime("%Y%m%d"), "qfq")
-    if df is None or df.empty:
+    """
+    获取全历史日线。
+    优先 Baostock → 失败降级 AKShare。
+    返回列：date, open, high, low, close, volume
+    """
+    end_str = datetime.today().strftime("%Y-%m-%d")
+
+    # ── 1. Baostock（主数据源） ──
+    _init_bs()
+    if _BS_READY:
+        try:
+            bs_code = _to_bs_code(code)
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume",
+                start_date="1990-01-01",
+                end_date=end_str,
+                frequency="d",
+                adjustflag="3",
+            )
+            if rs.error_code == '0':
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if rows:
+                    df = pd.DataFrame(rows, columns=["date","open","high","low","close","volume"])
+                    df["date"] = pd.to_datetime(df["date"])
+                    for col in ["open","high","low","close","volume"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    return df.sort_values("date").reset_index(drop=True)
+        except Exception:
+            pass
+
+    # ── 2. AKShare（降级） ──
+    try:
+        df = ak.stock_zh_a_hist(code, "daily", "19900101",
+                                 datetime.today().strftime("%Y%m%d"), "qfq")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df["日期"] = pd.to_datetime(df["日期"])
+        df = df.sort_values("日期").reset_index(drop=True)
+        for cn, en in {"日期":"date","开盘":"open","收盘":"close",
+                        "最高":"high","最低":"low","成交量":"volume"}.items():
+            if cn in df.columns:
+                df[en] = pd.to_numeric(df[cn], errors="coerce")
+        return df
+    except Exception:
         return pd.DataFrame()
-    df["日期"] = pd.to_datetime(df["日期"])
-    df = df.sort_values("日期").reset_index(drop=True)
-    # 添加英文别名列
-    for cn, en in {"日期":"date","开盘":"open","收盘":"close",
-                    "最高":"high","最低":"low","成交量":"volume"}.items():
-        if cn in df.columns:
-            df[en] = pd.to_numeric(df[cn], errors="coerce")
-    return df
 
 # ==================== Session State ====================
 for k, v in {"watchlist": _load_watchlist(), "batch_codes": [], "batch_results": None}.items():
