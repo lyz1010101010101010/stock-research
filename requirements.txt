@@ -4,3 +4,4 @@ numpy
 matplotlib
 yfinance
 plotly
+streamlit-plotly-events
