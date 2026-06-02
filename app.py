@@ -288,8 +288,15 @@ with tabs[0]:
         else:
             df_res = calc_daily_resonance(df)
 
-            # ---------- K 线（可点击） ----------
-            fig = make_subplots(rows=1, cols=1)
+            # ========== 统一图：K 线（上）+ 每日四维方块（下） ==========
+            fig = make_subplots(
+                rows=2, cols=1,
+                row_heights=[0.7, 0.3],
+                shared_xaxes=True,
+                vertical_spacing=0.03,
+            )
+
+            # ── Row 1: K 线 + MA ──
             fig.add_trace(go.Candlestick(
                 x=df["date"], open=df["open"], high=df["high"],
                 low=df["low"], close=df["close"],
@@ -299,20 +306,62 @@ with tabs[0]:
                 fig.add_trace(go.Scatter(x=df["date"], y=df["close"].rolling(p).mean(),
                                         line=dict(color=c, width=1), name=f"MA{p}"),
                              row=1, col=1)
+
+            # ── Row 2: 每日四维状态方块（4 行散点，每行一个维度） ──
+            def _dim_color(val):
+                s = str(val)
+                if "多头" in s or "偏多" in s or "放量" in s or "走强" in s:
+                    return "#00c853"
+                if "空头" in s or "偏空" in s or "缩量" in s or "走弱" in s:
+                    return "#ff1744"
+                return "#bdbdbd"
+
+            dim_config = [("趋势", "_trend", 3), ("量能", "_volume", 2),
+                          ("中期", "_medium", 1), ("短期", "_short", 0)]
+
+            for dname, dcol, ypos in dim_config:
+                colors = []
+                htext = []
+                for _, rr in df_res.iterrows():
+                    v = rr[dcol]
+                    colors.append(_dim_color(v))
+                    htext.append(f"{dname}<br>{v}")
+                fig.add_trace(go.Scatter(
+                    x=df["date"], y=[ypos] * len(df),
+                    mode="markers",
+                    marker=dict(size=16, color=colors, symbol="square",
+                                line=dict(width=0.3, color="white")),
+                    name=dname,
+                    text=htext,
+                    hoverinfo="text+x",
+                    showlegend=False,
+                ), row=2, col=1)
+
             fig.update_xaxes(range=[df["date"].min(), df["date"].max()],
                             rangeslider_visible=True, row=1, col=1)
+
             try:
                 stock_name = fetch_stock_name(code)
             except Exception:
                 stock_name = code
-            fig.update_layout(title=f"{code} {stock_name}  K线走势（点击任意日期查看四维状态）",
-                             height=550, template="plotly_white",
-                             hovermode="x unified",
-                             margin=dict(l=40, r=20, t=50, b=20))
 
-            # 使用 plotly_events 捕获点击
-            clicked = plotly_events(fig, click_event=True, override_height=580,
-                                    override_width="100%", key=f"kline_{code}")
+            fig.update_layout(
+                title=dict(text=f"{code} {stock_name}  —  K线 & 每日四维共振",
+                           x=0.5, font=dict(size=15)),
+                height=680,
+                template="plotly_white",
+                hovermode="x unified",
+                margin=dict(l=40, r=20, t=50, b=10),
+                xaxis2=dict(showgrid=False),
+                yaxis2=dict(tickvals=[3, 2, 1, 0],
+                           ticktext=["趋势", "量能", "中期", "短期"],
+                           range=[-0.5, 3.5],
+                           side="left"),
+            )
+
+            # ── 点击交互 ──
+            clicked = plotly_events(fig, click_event=True, override_height=720,
+                                    override_width="100%", key=f"kc_{code}")
 
             # ---------- 确定选中的日期 ----------
             if clicked and len(clicked) > 0:
@@ -333,35 +382,6 @@ with tabs[0]:
                 sel_date = row["date"].iloc[-1]
 
             r = row.iloc[0]
-            vals = [r["_trend"], r["_volume"], r["_medium"], r["_short"]]
-
-            # ---------- 四维共振横条 ----------
-            color_hex = {"🟢": "#00c853", "🔴": "#ff1744", "🟡": "#ffd600", "⚪": "#bdbdbd", "🔥": "#00c853", "❄️": "#ff1744"}
-            bar_colors = []
-            for v in vals:
-                first = v[0] if len(v) > 0 else "⚪"
-                bar_colors.append(color_hex.get(first, "#bdbdbd"))
-
-            bar_fig = go.Figure()
-            bar_fig.add_trace(go.Bar(
-                x=["趋势", "量能", "中期", "短期"],
-                y=[1, 1, 1, 1],
-                marker_color=bar_colors,
-                text=[v for v in vals],
-                textposition="inside",
-                textfont=dict(color="white", size=13),
-                width=0.55,
-                showlegend=False,
-            ))
-            bar_fig.update_layout(
-                height=110,
-                margin=dict(l=10, r=10, t=5, b=5),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(showgrid=False, zeroline=False),
-                yaxis=dict(visible=False, range=[0, 1.8]),
-            )
-            st.plotly_chart(bar_fig, use_container_width=True, key=f"bar_{code}")
 
             # ---------- 当日快照文字 ----------
             date_str = sel_date.strftime("%Y-%m-%d") if hasattr(sel_date, "strftime") else str(sel_date)
