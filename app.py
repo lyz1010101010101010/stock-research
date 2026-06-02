@@ -215,13 +215,37 @@ def calc_daily_resonance(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=600, show_spinner=False)
 def _fetch_kline(code):
     """
-    获取全历史日线。
-    优先 Baostock → 失败降级 AKShare。
+    获取全历史日线（前复权）。
+    优先 AKShare 前复权 → 失败降级 Baostock 前复权。
     返回列：date, open, high, low, close, volume
+    禁止出现未复权的价格断层。
     """
-    end_str = datetime.today().strftime("%Y-%m-%d")
+    # ── 1. AKShare 前复权（主数据源，adjust="qfq"）──
+    try:
+        df = ak.stock_zh_a_hist(
+            code, "daily", "19900101",
+            datetime.today().strftime("%Y%m%d"), "qfq",
+        )
+        if df is not None and not df.empty:
+            # 统一列名为英文
+            col_map = {"日期": "date", "开盘": "open", "收盘": "close",
+                       "最高": "high", "最低": "low", "成交量": "volume"}
+            df = df.rename(columns=col_map)
+            keep_cols = ["date", "open", "high", "low", "close", "volume"]
+            df = df[[c for c in keep_cols if c in df.columns]]
+            df["date"] = pd.to_datetime(df["date"])
+            for col in ["open", "high", "low", "close", "volume"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            # 丢弃 OHLC 含 NaN 的行（禁止价格断层）
+            df = df.dropna(subset=["open", "high", "low", "close"])
+            df = df.sort_values("date").reset_index(drop=True)
+            if len(df) >= 20:
+                return df
+    except Exception:
+        pass
 
-    # ── 1. Baostock（主数据源） ──
+    # ── 2. Baostock 前复权（降级，adjustflag="2"）──
     _init_bs()
     if _BS_READY:
         try:
@@ -230,38 +254,25 @@ def _fetch_kline(code):
                 bs_code,
                 "date,open,high,low,close,volume",
                 start_date="1990-01-01",
-                end_date=end_str,
+                end_date=datetime.today().strftime("%Y-%m-%d"),
                 frequency="d",
-                adjustflag="3",
+                adjustflag="2",  # 前复权
             )
             if rs.error_code == '0':
                 rows = []
                 while rs.next():
                     rows.append(rs.get_row_data())
                 if rows:
-                    df = pd.DataFrame(rows, columns=["date","open","high","low","close","volume"])
+                    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
                     df["date"] = pd.to_datetime(df["date"])
-                    for col in ["open","high","low","close","volume"]:
+                    for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df = df.dropna(subset=["open", "high", "low", "close"])
                     return df.sort_values("date").reset_index(drop=True)
         except Exception:
             pass
 
-    # ── 2. AKShare（降级） ──
-    try:
-        df = ak.stock_zh_a_hist(code, "daily", "19900101",
-                                 datetime.today().strftime("%Y%m%d"), "qfq")
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df["日期"] = pd.to_datetime(df["日期"])
-        df = df.sort_values("日期").reset_index(drop=True)
-        for cn, en in {"日期":"date","开盘":"open","收盘":"close",
-                        "最高":"high","最低":"low","成交量":"volume"}.items():
-            if cn in df.columns:
-                df[en] = pd.to_numeric(df[cn], errors="coerce")
-        return df
-    except Exception:
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 # ==================== Session State ====================
 for k, v in {"watchlist": _load_watchlist(), "batch_codes": [], "batch_results": None}.items():
@@ -297,15 +308,24 @@ with tabs[0]:
             )
 
             # ── Row 1: K 线 + MA ──
+            # 蜡烛图宽度自适应：数据量大时收窄边框，避免蜡烛过细
+            n_klines = len(df)
+            cw = 1.0 if n_klines <= 1000 else (0.6 if n_klines <= 3000 else 0.3)
             fig.add_trace(go.Candlestick(
                 x=df["date"], open=df["open"], high=df["high"],
                 low=df["low"], close=df["close"],
-                increasing_line_color="#ef5350", decreasing_line_color="#26a69a",
+                increasing=dict(line=dict(color="#ef5350", width=cw)),
+                decreasing=dict(line=dict(color="#26a69a", width=cw)),
                 name="K线"), row=1, col=1)
             for p, c in [(20, "#ff9800"), (60, "#1565c0")]:
-                fig.add_trace(go.Scatter(x=df["date"], y=df["close"].rolling(p).mean(),
-                                        line=dict(color=c, width=1), name=f"MA{p}"),
-                             row=1, col=1)
+                ma_raw = df["close"].rolling(p, min_periods=p).mean()
+                # 丢弃 NaN，禁止 MA 线穿过上市初期与当前的巨大价差断层
+                ma_valid = ma_raw.dropna()
+                fig.add_trace(go.Scatter(
+                    x=df["date"].iloc[ma_valid.index], y=ma_valid,
+                    line=dict(color=c, width=1), name=f"MA{p}",
+                    connectgaps=False,
+                ), row=1, col=1)
 
             # ── Row 2: 每日四维状态方块（4 行散点，每行一个维度） ──
             def _dim_color(val):
@@ -337,8 +357,12 @@ with tabs[0]:
                     showlegend=False,
                 ), row=2, col=1)
 
-            fig.update_xaxes(range=[df["date"].min(), df["date"].max()],
-                            rangeslider_visible=True, row=1, col=1)
+            # 默认视图仅显示最近 500 个交易日（约 2 年），保留 rangeslider 允许向左拖动
+            start_idx = max(0, len(df) - 500)
+            fig.update_xaxes(
+                range=[df["date"].iloc[start_idx], df["date"].iloc[-1]],
+                rangeslider_visible=True, row=1, col=1,
+            )
 
             try:
                 stock_name = fetch_stock_name(code)
