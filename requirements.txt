@@ -5,3 +5,4 @@ matplotlib
 yfinance
 plotly
 streamlit-plotly-events
+baostock
